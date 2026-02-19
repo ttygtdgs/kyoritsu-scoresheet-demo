@@ -1,11 +1,15 @@
 """
 共立製薬 スコアシート分析ダッシュボード
 ========================================
-デモ用Streamlitアプリ（CSVデータソース）
+デモ用Streamlitアプリ（Snowflake / CSVフォールバック）
 
 起動方法:
     cd demo-data
     streamlit run dashboard.py
+
+Snowflake接続:
+    .streamlit/secrets.toml に接続情報を記入
+    接続失敗時はローカルCSVにフォールバック
 """
 
 import pathlib
@@ -16,11 +20,17 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+try:
+    import snowflake.connector
+    HAS_SNOWFLAKE = True
+except ImportError:
+    HAS_SNOWFLAKE = False
+
 # ---------------------------------------------------------------------------
 # 設定
 # ---------------------------------------------------------------------------
 st.set_page_config(
-    page_title="共立製薬 スコアシート分析",
+    page_title="共立製薬様デモ スコアシート分析",
     page_icon="🔬",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -52,11 +62,48 @@ COLOR_TREATED = "#1f77b4"
 COLOR_CONTROL = "#ff7f0e"
 
 # ---------------------------------------------------------------------------
-# データ読み込み & ビュー構築
+# Snowflake接続
 # ---------------------------------------------------------------------------
 
-@st.cache_data
-def load_data():
+def _get_snowflake_connection():
+    """Streamlit secretsからSnowflake接続を取得"""
+    sf = st.secrets["snowflake"]
+    return snowflake.connector.connect(
+        account=sf["account"],
+        user=sf["user"],
+        password=sf["password"],
+        warehouse=sf["warehouse"],
+        database=sf["database"],
+        schema=sf["schema"],
+    )
+
+
+def _load_from_snowflake():
+    """Snowflakeからデータを読み込む"""
+    conn = _get_snowflake_connection()
+    try:
+        study = pd.read_sql("SELECT * FROM STUDY", conn)
+        sheet = pd.read_sql("SELECT * FROM SCORE_SHEET", conn)
+        df = pd.read_sql("SELECT * FROM V_OBSERVATION_DETAIL", conn)
+    finally:
+        conn.close()
+
+    # Snowflakeはカラム名を大文字で返すため小文字に統一
+    study.columns = study.columns.str.lower()
+    sheet.columns = sheet.columns.str.lower()
+    df.columns = df.columns.str.lower()
+
+    # datetime変換
+    df["observed_at"] = pd.to_datetime(df["observed_at"])
+    df["observation_date"] = df["observed_at"].dt.date
+    df["study_period_start"] = pd.to_datetime(df["study_period_start"])
+
+    obs = df  # KPI用カウントに使用
+    return study, sheet, obs, df
+
+
+def _load_from_csv():
+    """ローカルCSVからデータを読み込む（フォールバック）"""
     study = pd.read_csv(CSV_DIR / "study.csv")
     sheet = pd.read_csv(CSV_DIR / "score_sheet.csv")
     obs = pd.read_csv(CSV_DIR / "observation.csv")
@@ -83,10 +130,49 @@ def load_data():
     # 臨床スコア合計
     df["total_clinical_score"] = df[CLINICAL_ITEMS].sum(axis=1)
 
+    # image_path がない場合は空文字カラム追加
+    if "image_path" not in df.columns:
+        df["image_path"] = ""
+
     return study, sheet, obs, df
 
 
+def _load_audit_log():
+    """監査ログを読み込む"""
+    audit_path = CSV_DIR / "audit_log.csv"
+    if audit_path.exists():
+        audit = pd.read_csv(audit_path)
+        audit["timestamp"] = pd.to_datetime(audit["timestamp"])
+        audit["date"] = audit["timestamp"].dt.date
+        return audit
+    return pd.DataFrame()
+
+
+# ---------------------------------------------------------------------------
+# データ読み込み（Snowflake優先 → CSVフォールバック）
+# ---------------------------------------------------------------------------
+
+@st.cache_data(ttl=600)
+def load_data():
+    if HAS_SNOWFLAKE and "snowflake" in st.secrets:
+        try:
+            data = _load_from_snowflake()
+            st.sidebar.success("Snowflake接続中", icon="❄️")
+            return data
+        except Exception as e:
+            st.sidebar.warning(f"Snowflake接続失敗: {e}")
+
+    st.sidebar.info("ローカルCSVモード", icon="📁")
+    return _load_from_csv()
+
+
 study_df, sheet_df, obs_df, detail_df = load_data()
+
+@st.cache_data(ttl=600)
+def load_audit():
+    return _load_audit_log()
+
+audit_df = load_audit()
 
 # ---------------------------------------------------------------------------
 # サイドバー
@@ -99,13 +185,16 @@ PAGES = {
     "個体検索": "animal_search",
     "異常アラート": "alerts",
     "示唆・インサイト": "insights",
+    "監査証跡": "audit_log",
 }
+
+IMAGE_DIR = pathlib.Path(__file__).parent / "images"
 
 st.sidebar.title("スコアシート分析")
 st.sidebar.markdown("---")
 page = st.sidebar.radio("ページ選択", list(PAGES.keys()))
 st.sidebar.markdown("---")
-st.sidebar.caption("共立製薬 データ基盤デモ")
+st.sidebar.caption("共立製薬様デモ")
 
 # ---------------------------------------------------------------------------
 # Page 1: 概要ダッシュボード
@@ -452,6 +541,20 @@ def page_animal_search():
         fig.update_layout(height=400)
         st.plotly_chart(fig, use_container_width=True)
 
+        # 記録画像セクション
+        images_for_animal = adf[adf["image_path"].fillna("").str.len() > 0]
+        if not images_for_animal.empty:
+            st.subheader(f"{selected_animal} の記録画像")
+            img_cols = st.columns(min(4, len(images_for_animal)))
+            for idx, (_, img_row) in enumerate(images_for_animal.iterrows()):
+                img_path = IMAGE_DIR.parent / img_row["image_path"]
+                col_idx = idx % len(img_cols)
+                with img_cols[col_idx]:
+                    if img_path.exists():
+                        st.image(str(img_path), caption=f"Day {int(img_row['day_number'])}", use_container_width=True)
+                    else:
+                        st.info(f"Day {int(img_row['day_number'])}: 画像未生成")
+
         # 全項目テーブル
         display_cols = ["day_number", "rectal_temperature", "body_weight"] + CLINICAL_ITEMS + ["total_clinical_score", "remarks"]
         rename = {"day_number": "Day", "rectal_temperature": "体温", "body_weight": "体重",
@@ -503,6 +606,7 @@ def page_alerts():
             reasons.append(f"同時異常 {abnormal_count}項目")
 
         if reasons:
+            has_image = bool(row.get("image_path") and str(row.get("image_path", "")).strip())
             alerts.append({
                 "試験名": row["study_name"],
                 "個体番号": row["animal_id"],
@@ -510,7 +614,9 @@ def page_alerts():
                 "Day": row["day_number"],
                 "体温": row["rectal_temperature"],
                 "臨床スコア": int(row["total_clinical_score"]),
+                "画像": "📷" if has_image else "",
                 "検出理由": " / ".join(reasons),
+                "_image_path": row.get("image_path", "") if has_image else "",
             })
 
     alert_df = pd.DataFrame(alerts)
@@ -529,10 +635,23 @@ def page_alerts():
 
     # アラート一覧
     st.subheader("アラート一覧")
-    st.dataframe(
-        alert_df.sort_values(["試験名", "個体番号", "Day"]),
-        use_container_width=True, hide_index=True,
-    )
+    display_alert_df = alert_df.drop(columns=["_image_path"]).sort_values(["試験名", "個体番号", "Day"])
+    st.dataframe(display_alert_df, use_container_width=True, hide_index=True)
+
+    # 画像付きアラートの画像表示
+    alerts_with_images = alert_df[alert_df["_image_path"].str.len() > 0]
+    if not alerts_with_images.empty:
+        st.markdown("---")
+        st.subheader("アラート関連記録画像")
+        img_cols = st.columns(min(4, len(alerts_with_images)))
+        for idx, (_, arow) in enumerate(alerts_with_images.head(8).iterrows()):
+            img_path = IMAGE_DIR.parent / arow["_image_path"]
+            col_idx = idx % len(img_cols)
+            with img_cols[col_idx]:
+                if img_path.exists():
+                    st.image(str(img_path),
+                             caption=f"{arow['個体番号']} Day{int(arow['Day'])}",
+                             use_container_width=True)
 
     st.markdown("---")
 
@@ -835,6 +954,132 @@ def page_insights():
 
 
 # ---------------------------------------------------------------------------
+# Page 8: 監査証跡
+# ---------------------------------------------------------------------------
+def page_audit_log():
+    st.title("監査証跡（データ変更ログ）")
+    st.markdown("GCP査察対応: 誰がいつどのデータを登録・修正したかの履歴を表示します。")
+
+    if audit_df.empty:
+        st.warning("監査ログデータがありません。`generate_demo_data.py` を再実行してください。")
+        return
+
+    # フィルタ
+    col1, col2, col3, col4 = st.columns(4)
+    with col1:
+        operations = ["すべて"] + sorted(audit_df["operation"].unique().tolist())
+        op_filter = st.selectbox("操作種別", operations, key="audit_op")
+    with col2:
+        users = ["すべて"] + sorted(audit_df["user_name"].unique().tolist())
+        user_filter = st.selectbox("操作者", users, key="audit_user")
+    with col3:
+        tables = ["すべて"] + sorted(audit_df["table_name"].unique().tolist())
+        table_filter = st.selectbox("テーブル", tables, key="audit_table")
+    with col4:
+        date_range = st.date_input(
+            "期間",
+            value=(audit_df["date"].min(), audit_df["date"].max()),
+            key="audit_date",
+        )
+
+    # フィルタ適用
+    filtered = audit_df.copy()
+    if op_filter != "すべて":
+        filtered = filtered[filtered["operation"] == op_filter]
+    if user_filter != "すべて":
+        filtered = filtered[filtered["user_name"] == user_filter]
+    if table_filter != "すべて":
+        filtered = filtered[filtered["table_name"] == table_filter]
+    if isinstance(date_range, tuple) and len(date_range) == 2:
+        filtered = filtered[(filtered["date"] >= date_range[0]) & (filtered["date"] <= date_range[1])]
+
+    st.markdown("---")
+
+    # KPI
+    col1, col2, col3, col4 = st.columns(4)
+    col1.metric("総操作数", f"{len(filtered):,} 件")
+    col2.metric("INSERT", f"{(filtered['operation'] == 'INSERT').sum():,} 件")
+    col3.metric("UPDATE", f"{(filtered['operation'] == 'UPDATE').sum():,} 件", delta=None)
+    col4.metric("操作者数", f"{filtered['user_name'].nunique()} 名")
+
+    st.markdown("---")
+
+    # タイムラインチャート
+    st.subheader("操作数の日別推移")
+    daily = filtered.groupby(["date", "operation"]).size().reset_index(name="件数")
+    fig = px.bar(
+        daily, x="date", y="件数", color="operation",
+        color_discrete_map={"INSERT": "#1f77b4", "UPDATE": "#ff7f0e", "DELETE": "#d62728"},
+        labels={"date": "日付", "件数": "操作数", "operation": "操作種別"},
+        barmode="stack",
+    )
+    fig.update_layout(height=350, margin=dict(t=20))
+    st.plotly_chart(fig, use_container_width=True)
+
+    st.markdown("---")
+
+    # 操作者別集計
+    st.subheader("操作者別集計")
+    user_summary = filtered.groupby(["user_name", "operation"]).size().reset_index(name="件数")
+    fig_user = px.bar(
+        user_summary, x="user_name", y="件数", color="operation",
+        color_discrete_map={"INSERT": "#1f77b4", "UPDATE": "#ff7f0e"},
+        labels={"user_name": "操作者", "件数": "操作数", "operation": "操作種別"},
+        barmode="group",
+    )
+    fig_user.update_layout(height=300, margin=dict(t=20))
+    st.plotly_chart(fig_user, use_container_width=True)
+
+    st.markdown("---")
+
+    # 変更ログテーブル
+    st.subheader("変更ログ一覧")
+
+    # UPDATEのみ抽出オプション
+    show_updates_only = st.checkbox("UPDATEのみ表示", value=False, key="audit_updates_only")
+    display = filtered.copy()
+    if show_updates_only:
+        display = display[display["operation"] == "UPDATE"]
+
+    # 表示用カラム
+    display_cols = ["timestamp", "user_name", "operation", "table_name",
+                    "field_name", "old_value", "new_value", "reason"]
+    display_renamed = display[display_cols].rename(columns={
+        "timestamp": "日時",
+        "user_name": "操作者",
+        "operation": "操作",
+        "table_name": "テーブル",
+        "field_name": "変更項目",
+        "old_value": "変更前",
+        "new_value": "変更後",
+        "reason": "理由",
+    })
+
+    # UPDATEレコードの強調表示
+    def _highlight_updates(row):
+        if row["操作"] == "UPDATE":
+            return ["background-color: #fff3e0"] * len(row)
+        return [""] * len(row)
+
+    styled = display_renamed.sort_values("日時", ascending=False).head(100).style.apply(
+        _highlight_updates, axis=1
+    )
+    st.dataframe(styled, use_container_width=True, hide_index=True)
+
+    if len(display) > 100:
+        st.caption(f"※ 最新100件を表示しています（全{len(display)}件）")
+
+    # CSVダウンロード
+    csv_data = display[display_cols].to_csv(index=False).encode("utf-8-sig")
+    st.download_button(
+        label="監査ログをCSVダウンロード",
+        data=csv_data,
+        file_name="audit_log_export.csv",
+        mime="text/csv",
+    )
+
+
+# ---------------------------------------------------------------------------
 # ルーティング
 # ---------------------------------------------------------------------------
 page_key = PAGES[page]
@@ -852,3 +1097,5 @@ elif page_key == "alerts":
     page_alerts()
 elif page_key == "insights":
     page_insights()
+elif page_key == "audit_log":
+    page_audit_log()
